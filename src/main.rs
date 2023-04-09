@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{File, OpenOptions},
     io::AsyncWriteExt,
+    signal::unix::{signal, SignalKind},
 };
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +44,140 @@ struct PrivMsg<'a> {
 
 #[tokio::main]
 async fn main() {
+    let (mut irc_channels, mut file_handles) = load_config().await;
+
+    let mut sighup_stream = signal(SignalKind::hangup()).expect("create sighup stream");
+
+    let irc_config = Config {
+        nickname: Some("justinfan12345".to_owned()),
+        server: Some("irc.chat.twitch.tv".to_owned()),
+        use_tls: Some(true),
+        channels: irc_channels.clone(),
+        ..Default::default()
+    };
+
+    let mut irc_client = Client::from_config(irc_config)
+        .await
+        .expect("valid IRC client config");
+
+    irc_client
+        .send_cap_req(&[
+            Capability::Custom("twitch.tv/tags"),
+            Capability::Custom("twitch.tv/commands"),
+        ])
+        .expect("send capability request");
+    irc_client.identify().expect("IRC identify");
+
+    let mut irc_stream = irc_client.stream().expect("IRC stream");
+
+    loop {
+        tokio::select! {
+            _ = sighup_stream.recv() => {
+                let (new_irc_channels, new_file_handles) = load_config().await;
+                let removed_irc_channels: Vec<_> = irc_channels.clone().into_iter().filter(|c| !new_irc_channels.contains(c)).collect();
+                let added_irc_channels: Vec<_> = new_irc_channels.clone().into_iter().filter(|c| !irc_channels.contains(c)).collect();
+                if !removed_irc_channels.is_empty() {
+                    irc_client.send_part(removed_irc_channels.join(",")).expect("leave removed chanels");
+                }
+                file_handles = new_file_handles;
+                if !added_irc_channels.is_empty() {
+                    irc_client.send_join(added_irc_channels.join(",")).expect("join added channels");
+                }
+                irc_channels = new_irc_channels;
+                println!("Reloaded config.");
+            }
+            Some(irc_event) = irc_stream.next() => {
+                let message = irc_event.expect("get IRC message");
+                match message.clone().command {
+                    Command::PRIVMSG(ref channel_name, ref msg) => {
+                        let priv_msg = PrivMsg {
+                            sender: message.source_nickname().unwrap_or("???"),
+                            message: msg,
+                            tags: tags_to_map(message.clone().tags),
+                        };
+
+                        file_handles
+                            .write_to_log(
+                                channel_name,
+                                format!("PRIVMSG{}\n", ron::to_string(&priv_msg).unwrap()),
+                            )
+                            .await;
+                    }
+
+                    Command::Raw(command, value) => match command.as_str() {
+                        "CLEARCHAT" => match value.len() {
+                            1 => {
+                                file_handles
+                                    .write_to_log(
+                                        value.get(0).unwrap(),
+                                        format!(
+                                            "{}(tags:{})\n",
+                                            command,
+                                            ron::to_string(&tags_to_map(message.tags)).unwrap()
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            2 => {
+                                file_handles
+                                    .write_to_log(
+                                        value.get(0).unwrap(),
+                                        format!(
+                                            "{}(user:\"{}\",tags:{})\n",
+                                            command,
+                                            value.get(1).unwrap(),
+                                            ron::to_string(&tags_to_map(message.tags)).unwrap()
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            _ => {
+                                panic!(
+                                    "unexpected number of params for CLEARCHAT: {}",
+                                    value.join(" ")
+                                )
+                            }
+                        },
+                        "CLEARMSG" => {
+                            file_handles
+                                .write_to_log(
+                                    value.get(0).unwrap(),
+                                    format!(
+                                        "{}(message:\"{}\",tags:{})\n",
+                                        command,
+                                        value.get(1).unwrap(),
+                                        ron::to_string(&tags_to_map(message.tags)).unwrap()
+                                    ),
+                                )
+                                .await;
+                        }
+                        "ROOMSTATE" | "USERNOTICE" => {
+                            file_handles
+                                .write_to_log(
+                                    value.get(0).unwrap(),
+                                    format!(
+                                        "{}(tags:{})\n",
+                                        command,
+                                        ron::to_string(&tags_to_map(message.tags)).unwrap()
+                                    ),
+                                )
+                                .await;
+                        }
+                        _ => {
+                            print_message(&message);
+                        }
+                    },
+                    _ => {
+                        print_message(&message);
+                    }
+                }
+            }
+            else => break
+        }
+    }
+}
+
+async fn load_config() -> (Vec<String>, FileHandleManager) {
     let ghost_config = ron::from_str::<GhostConfig>(
         &tokio::fs::read_to_string("config.ron")
             .await
@@ -65,17 +200,23 @@ async fn main() {
         .await
         .expect("create log directory");
 
+    let file_handles = open_log_files(&irc_channels.clone()).await;
+    (irc_channels, file_handles)
+}
+
+async fn open_log_files(irc_channels: &[String]) -> FileHandleManager {
     let startup_time = chrono::Local::now().to_rfc3339();
 
-    let mut file_handles = FileHandleManager(
-        join_all(irc_channels.clone().into_iter().map(|c| async {
+    FileHandleManager(
+        join_all(irc_channels.iter().map(|c| async {
+            let c = c.to_owned();
             let mut file = OpenOptions::new()
                 .append(true)
                 .create(true)
                 .open(format!("logs/{}.txt", c))
                 .await
                 .expect("open/create log file");
-            file.write_all(format!("// Started at {}\n", startup_time).as_bytes())
+            file.write_all(format!("// File opened at {}\n", startup_time).as_bytes())
                 .await
                 .expect("write initial line");
             (c, file)
@@ -83,124 +224,20 @@ async fn main() {
         .await
         .into_iter()
         .collect(),
-    );
-
-    let config = Config {
-        nickname: Some("justinfan12345".to_owned()),
-        server: Some("irc.chat.twitch.tv".to_owned()),
-        use_tls: Some(true),
-        channels: irc_channels,
-        ..Default::default()
-    };
-
-    let mut client = Client::from_config(config)
-        .await
-        .expect("valid IRC client config");
-
-    client
-        .send_cap_req(&[
-            Capability::Custom("twitch.tv/tags"),
-            Capability::Custom("twitch.tv/commands"),
-        ])
-        .expect("send capability request");
-    client.identify().expect("IRC identify");
-
-    let mut stream = client.stream().expect("IRC stream");
-
-    while let Some(message) = stream.next().await.transpose().expect("stream IRC stream") {
-        match message.clone().command {
-            Command::PRIVMSG(ref channel_name, ref msg) => {
-                let priv_msg = PrivMsg {
-                    sender: message.source_nickname().unwrap_or("???"),
-                    message: msg,
-                    tags: tags_to_map(message.clone().tags),
-                };
-
-                file_handles
-                    .write_to_log(
-                        channel_name,
-                        format!("PRIVMSG{}\n", ron::to_string(&priv_msg).unwrap()),
-                    )
-                    .await;
-            }
-
-            Command::Raw(command, value) => match command.as_str() {
-                "CLEARCHAT" => match value.len() {
-                    1 => {
-                        file_handles
-                            .write_to_log(
-                                value.get(0).unwrap(),
-                                format!(
-                                    "{}(tags:{})\n",
-                                    command,
-                                    ron::to_string(&tags_to_map(message.tags)).unwrap()
-                                ),
-                            )
-                            .await;
-                    }
-                    2 => {
-                        file_handles
-                            .write_to_log(
-                                value.get(0).unwrap(),
-                                format!(
-                                    "{}(user:\"{}\",tags:{})\n",
-                                    command,
-                                    value.get(1).unwrap(),
-                                    ron::to_string(&tags_to_map(message.tags)).unwrap()
-                                ),
-                            )
-                            .await;
-                    }
-                    _ => {
-                        panic!(
-                            "unexpected number of params for CLEARCHAT: {}",
-                            value.join(" ")
-                        )
-                    }
-                },
-                "CLEARMSG" => {
-                    file_handles
-                        .write_to_log(
-                            value.get(0).unwrap(),
-                            format!(
-                                "{}(message:\"{}\",tags:{})\n",
-                                command,
-                                value.get(1).unwrap(),
-                                ron::to_string(&tags_to_map(message.tags)).unwrap()
-                            ),
-                        )
-                        .await;
-                }
-                "ROOMSTATE"|"USERNOTICE" => {
-                    file_handles
-                        .write_to_log(
-                            value.get(0).unwrap(),
-                            format!(
-                                "{}(tags:{})\n",
-                                command,
-                                ron::to_string(&tags_to_map(message.tags)).unwrap()
-                            ),
-                        )
-                        .await;
-                }
-                _ => {
-                    print_message(&message);
-                }
-            },
-            _ => {
-                print_message(&message);
-            }
-        }
-    }
+    )
 }
 
 fn print_message(message: &Message) {
     println!(
         "{:?} {}{:?}",
         tags_to_map(message.clone().tags),
-        message.prefix.clone().map(|p| format!("{:?} | ", p)).unwrap_or("".to_owned()),
+        message
+            .prefix
+            .clone()
+            .map(|p| format!("{:?} | ", p))
+            .unwrap_or("".to_owned()),
         message.command
-    );
+    )
 }
 
 fn tags_to_map(tags: Option<Vec<Tag>>) -> BTreeMap<String, String> {

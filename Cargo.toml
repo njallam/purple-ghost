@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-chrono = "0.4.24"
+chrono = "0.4"
 futures-util = "0.3"
 irc = { version = "0.15", default-features = false, features = ["tls-rust"] }
 ron = "0.8"
