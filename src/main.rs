@@ -189,7 +189,7 @@ async fn load_config() -> (Vec<String>, FileHandleManager) {
         .channels
         .into_iter()
         .map(|c| {
-            if !c.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            if !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
                 panic!("Invalid channel name: {}", c);
             }
             format!("#{}", c.to_ascii_lowercase())
