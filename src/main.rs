@@ -24,7 +24,7 @@ impl FileHandleManager {
     pub async fn write_to_log(&mut self, channel_name: &String, line: String) {
         match self.0.get_mut(channel_name) {
             Some(file) => file
-                .write_all(line.as_bytes())
+                .write_all(format!("{} // {}\n", line, chrono::Local::now().to_rfc3339()).as_bytes())
                 .await
                 .expect("append to file"),
             None => eprintln!(
@@ -99,7 +99,7 @@ async fn main() {
                         file_handles
                             .write_to_log(
                                 channel_name,
-                                format!("PRIVMSG{}\n", ron::to_string(&priv_msg).unwrap()),
+                                format!("PRIVMSG{}", ron::to_string(&priv_msg).unwrap()),
                             )
                             .await;
                     }
@@ -111,7 +111,7 @@ async fn main() {
                                     .write_to_log(
                                         value.get(0).unwrap(),
                                         format!(
-                                            "{}(tags:{})\n",
+                                            "{}(tags:{})",
                                             command,
                                             ron::to_string(&tags_to_map(message.tags)).unwrap()
                                         ),
@@ -123,7 +123,7 @@ async fn main() {
                                     .write_to_log(
                                         value.get(0).unwrap(),
                                         format!(
-                                            "{}(user:\"{}\",tags:{})\n",
+                                            "{}(user:\"{}\",tags:{})",
                                             command,
                                             value.get(1).unwrap(),
                                             ron::to_string(&tags_to_map(message.tags)).unwrap()
@@ -143,7 +143,7 @@ async fn main() {
                                 .write_to_log(
                                     value.get(0).unwrap(),
                                     format!(
-                                        "{}(message:\"{}\",tags:{})\n",
+                                        "{}(message:\"{}\",tags:{})",
                                         command,
                                         value.get(1).unwrap(),
                                         ron::to_string(&tags_to_map(message.tags)).unwrap()
@@ -156,7 +156,7 @@ async fn main() {
                                 .write_to_log(
                                     value.get(0).unwrap(),
                                     format!(
-                                        "{}(tags:{})\n",
+                                        "{}(tags:{})",
                                         command,
                                         ron::to_string(&tags_to_map(message.tags)).unwrap()
                                     ),
@@ -230,13 +230,13 @@ async fn open_log_files(irc_channels: &[String]) -> FileHandleManager {
 fn print_message(message: &Message) {
     println!(
         "{:?} {}{:?}",
-        tags_to_map(message.clone().tags),
+        message.command,
         message
             .prefix
             .clone()
-            .map(|p| format!("{:?} | ", p))
+            .map(|p| format!("from {:?} ", p))
             .unwrap_or("".to_owned()),
-        message.command
+        tags_to_map(message.clone().tags),
     )
 }
 
